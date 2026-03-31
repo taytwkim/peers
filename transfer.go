@@ -15,6 +15,13 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 )
 
+/*
+ * Transfer Protocol, stream-based protocol handling file downloads.
+ *
+ * setupTransferProtocol is called once in node startup.
+ * doFetch issues the transfer request, and handleTransferStream is the handler.
+ */
+
 const transferProtocol = "/p2pfs/get/1.0.0"
 
 type TransferRequest struct {
@@ -26,68 +33,10 @@ type TransferResponse struct {
 	Filesize int64  `json:"filesize,omitempty"`
 }
 
-// setupTransferProtocol is called in node.go when a daemon starts
-// handleTransferStream is the daemon-side handler
-
 func (n *Node) setupTransferProtocol() {
 	n.Host.SetStreamHandler(transferProtocol, n.handleTransferStream)
 }
 
-func (n *Node) handleTransferStream(s network.Stream) {
-	defer s.Close()
-
-	// Read Request
-	var req TransferRequest
-	decoder := json.NewDecoder(s)
-	if err := decoder.Decode(&req); err != nil {
-		log.Printf("Failed to read transfer request: %v", err)
-		return
-	}
-
-	encoder := json.NewEncoder(s)
-
-	log.Printf("Received GET request for %s from %s", req.Filename, s.Conn().RemotePeer())
-
-	// Safety: reject path traversal or absolute paths
-	if strings.Contains(req.Filename, "/") || strings.Contains(req.Filename, "\\") {
-		encoder.Encode(TransferResponse{Error: "Invalid filename format"})
-		return
-	}
-
-	targetPath := filepath.Join(n.ExportDir, req.Filename)
-
-	// Check if file exists
-	n.localFilesLock.RLock()
-	size, exists := n.LocalFiles[req.Filename]
-	n.localFilesLock.RUnlock()
-
-	if !exists {
-		encoder.Encode(TransferResponse{Error: "File not found"})
-		return
-	}
-
-	file, err := os.Open(targetPath)
-	if err != nil {
-		encoder.Encode(TransferResponse{Error: "Internal server error"})
-		return
-	}
-	defer file.Close()
-
-	// Send Response Header
-	if err := encoder.Encode(TransferResponse{Filesize: size}); err != nil {
-		return
-	}
-
-	// Stream Bytes
-	written, err := io.Copy(s, file)
-	if err != nil {
-		log.Printf("Error sending file %s: %v", req.Filename, err)
-	} else {
-		log.Printf("Sent %d bytes of %s to %s", written, req.Filename, s.Conn().RemotePeer())
-	}
-}
-
-// This is the client CLI-side handler
 func (n *Node) doFetch(filename string, targetPeerID string) error {
 	var target peer.ID
 	var err error
@@ -187,4 +136,58 @@ func (n *Node) doFetch(filename string, targetPeerID string) error {
 
 	log.Printf("Successfully downloaded %s", filename)
 	return nil
+}
+
+func (n *Node) handleTransferStream(s network.Stream) {
+	defer s.Close()
+
+	// Read Request
+	var req TransferRequest
+	decoder := json.NewDecoder(s)
+	if err := decoder.Decode(&req); err != nil {
+		log.Printf("Failed to read transfer request: %v", err)
+		return
+	}
+
+	encoder := json.NewEncoder(s)
+
+	log.Printf("Received GET request for %s from %s", req.Filename, s.Conn().RemotePeer())
+
+	// Safety: reject path traversal or absolute paths
+	if strings.Contains(req.Filename, "/") || strings.Contains(req.Filename, "\\") {
+		encoder.Encode(TransferResponse{Error: "Invalid filename format"})
+		return
+	}
+
+	targetPath := filepath.Join(n.ExportDir, req.Filename)
+
+	// Check if file exists
+	n.localFilesLock.RLock()
+	size, exists := n.LocalFiles[req.Filename]
+	n.localFilesLock.RUnlock()
+
+	if !exists {
+		encoder.Encode(TransferResponse{Error: "File not found"})
+		return
+	}
+
+	file, err := os.Open(targetPath)
+	if err != nil {
+		encoder.Encode(TransferResponse{Error: "Internal server error"})
+		return
+	}
+	defer file.Close()
+
+	// Send Response Header
+	if err := encoder.Encode(TransferResponse{Filesize: size}); err != nil {
+		return
+	}
+
+	// Stream Bytes
+	written, err := io.Copy(s, file)
+	if err != nil {
+		log.Printf("Error sending file %s: %v", req.Filename, err)
+	} else {
+		log.Printf("Sent %d bytes of %s to %s", written, req.Filename, s.Conn().RemotePeer())
+	}
 }

@@ -36,7 +36,7 @@ type Node struct {
 	rpcListener    net.Listener                        // rpcListener holds the open Unix Domain Socket listener for CLI clients.
 }
 
-// NewNode initializes a new libp2p node, connects to bootstrappers, and starts background tasks
+// NewNode initializes a new libp2p node, connects to bootstrap nodes, and starts background tasks
 func NewNode(listenAddr, exportDir, rpcSocket string, bootstrapAddrs []string) (*Node, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -71,12 +71,17 @@ func NewNode(listenAddr, exportDir, rpcSocket string, bootstrapAddrs []string) (
 		cancel()
 		return nil, fmt.Errorf("failed to create GossipSub: %w", err)
 	}
+	// ps is the PubSub instance that enables each node to join, publish to,
+	// and subscribe to the topic
+	// the actual subscription happens in discovery.go
 	n.PubSub = ps
 
-	// 3. Connect to Bootstrap peers
+	// 3. Connect to bootstrap peers
 	n.connectBootstrappers(bootstrapAddrs)
 
 	// 4. Register RPC and background tasks
+	// RPC server is the endpoint nodes expose
+	// to accept CLI-issued commands
 	if err := n.startRPCServer(); err != nil {
 		h.Close()
 		cancel()
@@ -106,7 +111,7 @@ func (n *Node) Close() error {
 	return n.Host.Close()
 }
 
-// connectBootstrappers parses multiaddrs and connects to them
+// parses multiaddrs of bootstrap nodes and connects to them
 func (n *Node) connectBootstrappers(addrs []string) {
 	var wg sync.WaitGroup
 	// iterate list of known bootstrap nodes and try to connect to ALL of them
@@ -148,9 +153,9 @@ func (n *Node) connectBootstrappers(addrs []string) {
 	wg.Wait()
 }
 
-// wrapper that calls updateLocalFiles periodically
+// wrapper to call updateLocalFiles periodically
 func (n *Node) scanLocalFiles() {
-	// we poll because we want to check whether the use has uploaded a new file in export_dir
+	// we poll because we want to check whether the user has uploaded a new file in export_dir
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 

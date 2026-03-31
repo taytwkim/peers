@@ -11,6 +11,13 @@ import (
 	"github.com/multiformats/go-multiaddr"
 )
 
+/*
+ * Index Protocol, stream-based request protocol allowing peers to manually verify what files a target peer is serving.
+ *
+ * setupIndexProtocol is called once in node startup.
+ * doList issues the list request, and handleIndexStream is the handler.
+ */
+
 const indexProtocol = "/p2pfs/index/1.0.0"
 
 type IndexRequest struct {
@@ -24,50 +31,10 @@ type IndexResponse struct {
 	Error string   `json:"error,omitempty"`
 }
 
-// setupIndexProtocol is called in node.go when a daemon starts
-// handleIndexStream is the daemon-side handler
-
 func (n *Node) setupIndexProtocol() {
 	n.Host.SetStreamHandler(indexProtocol, n.handleIndexStream)
 }
 
-func (n *Node) handleIndexStream(s network.Stream) {
-	defer s.Close()
-
-	var req IndexRequest
-	decoder := json.NewDecoder(s)
-	if err := decoder.Decode(&req); err != nil {
-		log.Printf("Failed to read index request: %v", err)
-		return
-	}
-
-	encoder := json.NewEncoder(s)
-
-	switch req.Op {
-	case "LIST":
-		log.Printf("Received LIST request from %s", s.Conn().RemotePeer())
-		n.localFilesLock.RLock()
-		var files []string
-		for f := range n.LocalFiles {
-			files = append(files, f)
-		}
-		n.localFilesLock.RUnlock()
-
-		encoder.Encode(IndexResponse{Files: files})
-
-	case "HAS":
-		n.localFilesLock.RLock()
-		_, exists := n.LocalFiles[req.Filename]
-		n.localFilesLock.RUnlock()
-
-		encoder.Encode(IndexResponse{Has: exists})
-
-	default:
-		encoder.Encode(IndexResponse{Error: "Unknown operation"})
-	}
-}
-
-// CLI client-side request for list
 func (n *Node) doList(targetAddr string) ([]string, error) {
 	maddr, err := multiaddr.NewMultiaddr(targetAddr)
 	if err != nil {
@@ -107,4 +74,40 @@ func (n *Node) doList(targetAddr string) ([]string, error) {
 	}
 
 	return resp.Files, nil
+}
+
+func (n *Node) handleIndexStream(s network.Stream) {
+	defer s.Close()
+
+	var req IndexRequest
+	decoder := json.NewDecoder(s)
+	if err := decoder.Decode(&req); err != nil {
+		log.Printf("Failed to read index request: %v", err)
+		return
+	}
+
+	encoder := json.NewEncoder(s)
+
+	switch req.Op {
+	case "LIST":
+		log.Printf("Received LIST request from %s", s.Conn().RemotePeer())
+		n.localFilesLock.RLock()
+		var files []string
+		for f := range n.LocalFiles {
+			files = append(files, f)
+		}
+		n.localFilesLock.RUnlock()
+
+		encoder.Encode(IndexResponse{Files: files})
+
+	case "HAS":
+		n.localFilesLock.RLock()
+		_, exists := n.LocalFiles[req.Filename]
+		n.localFilesLock.RUnlock()
+
+		encoder.Encode(IndexResponse{Has: exists})
+
+	default:
+		encoder.Encode(IndexResponse{Error: "Unknown operation"})
+	}
 }

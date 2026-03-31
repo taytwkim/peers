@@ -9,6 +9,22 @@ import (
 	"time"
 )
 
+/*
+ * runDaemon starts the local node as a daemon.
+ *
+ * runWhohas, runFetch, and runList are CLI commands we use to issue requests to the
+ * local daemon over RPC.
+ *
+ * The daemon then decides what action to take.
+ * If needed, it uses do_X(...) functions to contact another peer,
+ * and that peer handles the request in handle_X(...).
+ *
+ * Example flow:
+ * 		1. We issue runFetch on CLI
+ * 		2. local daemon receives runFetch and calls doFetch (see rpc.go and transfer.go)
+ * 		3. remote peer receives doFetch which is handled by handleTransferStream (see transfer.go)
+ */
+
 func main() {
 	if len(os.Args) < 2 {
 		printUsage()
@@ -69,7 +85,7 @@ func runDaemon(args []string) {
 	}
 
 	// Start node, join discovery
-	node, err := NewNode(*listenAddr, *exportDir, *rpcOpt, bootstrapAddrs)
+	node, err := NewNode(*listenAddr, *exportDir, *rpcOpt, bootstrapAddrs) // in node.go
 	if err != nil {
 		log.Fatalf("Failed to create node: %v", err)
 	}
@@ -80,6 +96,21 @@ func runDaemon(args []string) {
 	// Keep daemon alive by blocking forever, note that NewNode is async
 	select {}
 }
+
+// ============================================================================
+// CLI Commands
+// These functions parse CLI input and issue requests to nodes running in the
+// background, such as whohas, fetch, and list.
+//
+// These functions do not talk to other peers directly.
+// Instead, they call the RPC client in rpc.go, which forwards the command to
+// the node.
+//
+// See rpc.go, which defines both:
+// 1. the CLI-side RPC functions that issue commands, and
+// 2. the daemon-side handlers that receive those commands and call functions
+//    like doList and doFetch.
+// ============================================================================
 
 // node X broadcasts whohas
 func runWhohas(args []string) {

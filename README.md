@@ -1,4 +1,4 @@
-# P2PFS: Peer-to-Peer File Sharing
+# Peer-to-Peer File Sharing
 
 The project is still in-progress.
 
@@ -45,13 +45,13 @@ Once the daemon is up and a network has been established over GossipSub, query a
 
 - `whohas`: Ask local daemon's provider index who has a specific file.
 ```bash
-./p2pfs whohas ubuntu.iso
+./p2pfs whohas foo.txt
 ```
 
 - `fetch`: Tell daemon to download a file from the network into its local `export_dir`.
 
 ```bash
-./p2pfs fetch ubuntu.iso
+./p2pfs fetch foo.txt
 ```
 
 - `list`: Connect to a remote peer explicitly and use the Index protocol to verify what they are serving.
