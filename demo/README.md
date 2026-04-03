@@ -39,7 +39,11 @@ along with a firewall rule that opens:
 - `tcp:22` for SSH
 - `tcp:4001-4010` for libp2p demo traffic
 
-After `terraform apply`, SSH into the VMs with `gcloud compute ssh`, clone this repo, and run `./p2pfs shell ...` manually for the presentation.
+After `terraform apply`, each VM will already have:
+
+- a recent Go toolchain installed
+- this repo cloned into `/opt/p2pfs`
+- a built `/opt/p2pfs/p2pfs` binary
 
 Suggested flow:
 
@@ -49,6 +53,6 @@ Suggested flow:
 4. `terraform init`
 5. `terraform apply`
 6. SSH into the three VMs with the `gcloud compute ssh ...` commands from Terraform outputs.
-7. Clone this repo on each VM and run `./p2pfs shell ...` manually for the live demo.
+7. SSH into the VMs and run the demo from `/opt/p2pfs`.
 
 Use `terraform destroy` when you are done.

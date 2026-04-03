@@ -20,3 +20,21 @@ variable "machine_type" {
   type        = string
   default     = "e2-micro"
 }
+
+variable "repo_url" {
+  description = "Git repository URL to clone on each VM."
+  type        = string
+  default     = "https://github.com/taytwkim/p2pfs.git"
+}
+
+variable "repo_branch" {
+  description = "Git branch to clone on each VM."
+  type        = string
+  default     = "main"
+}
+
+variable "go_version" {
+  description = "Go version to install on each VM."
+  type        = string
+  default     = "1.25.0"
+}

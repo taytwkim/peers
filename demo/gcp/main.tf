@@ -58,6 +58,26 @@ resource "google_compute_instance" "p2pfs_demo" {
     set -euxo pipefail
     export DEBIAN_FRONTEND=noninteractive
     apt-get update
-    apt-get install -y git golang-go
+    apt-get install -y ca-certificates curl git
+
+    cd /tmp
+    curl -fsSLO https://go.dev/dl/go${var.go_version}.linux-amd64.tar.gz
+    rm -rf /usr/local/go
+    tar -C /usr/local -xzf go${var.go_version}.linux-amd64.tar.gz
+    ln -sf /usr/local/go/bin/go /usr/local/bin/go
+    ln -sf /usr/local/go/bin/gofmt /usr/local/bin/gofmt
+
+    if [ ! -d /opt/p2pfs/.git ]; then
+      git clone --branch ${var.repo_branch} --single-branch ${var.repo_url} /opt/p2pfs
+    else
+      cd /opt/p2pfs
+      git fetch origin
+      git checkout ${var.repo_branch}
+      git pull --ff-only origin ${var.repo_branch}
+    fi
+
+    cd /opt/p2pfs
+    /usr/local/go/bin/go version
+    /usr/local/go/bin/go build -o p2pfs
   EOT
 }
