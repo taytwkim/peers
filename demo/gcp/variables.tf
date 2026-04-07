@@ -6,17 +6,17 @@ variable "project_id" {
 variable "region" {
   description = "GCP region for the demo network."
   type        = string
-  default     = "us-central1"
+  default     = "us-east5"
 }
 
 variable "zone" {
   description = "GCP zone for the demo instances."
   type        = string
-  default     = "us-central1-a"
+  default     = "us-east5-b"
 }
 
 variable "machine_type" {
   description = "Machine type for the demo VMs."
   type        = string
-  default     = "e2-micro"
+  default     = "e2-medium"
 }

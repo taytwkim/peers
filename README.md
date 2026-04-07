@@ -1,6 +1,4 @@
-# Peer-to-Peer File Sharing
-
-The project is still in-progress.
+# Peer-to-Peer File Sharing Network
 
 ## Overview
 
@@ -26,7 +24,7 @@ The `p2pfs` binary supports two usage patterns:
 - **Interactive shell mode**: Start a node in the foreground and type commands directly into a REPL.
 - **Daemon + RPC mode**: Start a node in the background and control it with stateless CLI commands over a local UNIX RPC socket.
 
-## Usage Mode 1: Interactive Shell
+## Mode 1: Interactive Shell
 
 Run a node in the foreground:
 
@@ -52,13 +50,14 @@ To join an existing network, add `--bootstrap`:
 - `aliases`: Show configured aliases.
 - `unalias <name>`: Remove an alias.
 - `echo <text> > <filename>`: Write a file into `export_dir` and rescan immediately.
+- `dump <# bytes> > <filename>`: Dump N random bytes to a file.
 - `rescan`: Rescan `export_dir` immediately.
 - `log`: Show buffered background logs.
 - `log clear`: Clear buffered background logs.
 - `clear`: Clear the terminal screen.
 - `exit`: Quit the interactive shell.
 
-## Usage Mode 2: Daemon + RPC CLI
+## Mode 2: RPC CLI
 
 ### Start a Daemon
 
@@ -96,21 +95,3 @@ Once the daemon is up and connected to the DHT through its bootstrap peers, cont
 ```bash
 ./p2pfs list --peer <REMOTE_MULTIADDR>
 ```
-
-## Cross-VM Demo
-
-GCP Terraform files for a simple 3-VM demo environment live under [demo/gcp](/Users/taykim/Desktop/p2p/demo/gcp).
-
-The Terraform in `demo/gcp` is intentionally minimal. It creates the VMs, network, and firewall rules, but leaves app installation and binary deployment to you.
-
-Suggested flow:
-
-1. `cd demo/gcp`
-2. `cp terraform.tfvars.example terraform.tfvars`
-3. Fill in your GCP project and preferred zone.
-4. `terraform init`
-5. `terraform apply`
-6. SSH into the three VMs with the `gcloud compute ssh ...` commands from Terraform outputs.
-7. Manually copy or clone the app onto the VMs and run `./p2pfs shell ...` for the live demo.
-
-Use `terraform destroy` when you are done.

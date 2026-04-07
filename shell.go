@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/rand"
 	"context"
 	"flag"
 	"fmt"
@@ -125,6 +126,9 @@ func (s *shellSession) prompt() string {
 func (s *shellSession) runCommand(line string) error {
 	if strings.HasPrefix(line, "echo ") {
 		return s.runEchoCommand(line)
+	}
+	if strings.HasPrefix(line, "dump ") {
+		return s.runDumpCommand(line)
 	}
 
 	args := strings.Fields(line)
@@ -418,6 +422,67 @@ func (s *shellSession) runEchoCommand(line string) error {
 	return nil
 }
 
+func (s *shellSession) runDumpCommand(line string) error {
+	body := strings.TrimSpace(strings.TrimPrefix(line, "dump"))
+	if body == "" {
+		return fmt.Errorf("usage: dump <bytes> > <filename>")
+	}
+
+	parts := strings.SplitN(body, ">", 2)
+	if len(parts) != 2 {
+		return fmt.Errorf("usage: dump <bytes> > <filename>")
+	}
+
+	sizeText := strings.TrimSpace(parts[0])
+	filename := strings.TrimSpace(parts[1])
+	if sizeText == "" || filename == "" {
+		return fmt.Errorf("usage: dump <bytes> > <filename>")
+	}
+	if strings.Contains(filename, "/") || strings.Contains(filename, "\\") {
+		return fmt.Errorf("filename must stay within export_dir")
+	}
+	if unquoted, err := strconv.Unquote(filename); err == nil {
+		filename = unquoted
+	}
+
+	size, err := strconv.Atoi(sizeText)
+	if err != nil || size < 0 {
+		return fmt.Errorf("byte count must be a non-negative integer")
+	}
+
+	content, err := randomPrintableBytes(size)
+	if err != nil {
+		return err
+	}
+
+	path := filepath.Join(s.node.ExportDir, filename)
+	if err := os.WriteFile(path, content, 0644); err != nil {
+		return err
+	}
+
+	s.node.updateLocalFiles()
+	s.printInfo("Wrote %d bytes to %s", size, filename)
+	return nil
+}
+
+func randomPrintableBytes(size int) ([]byte, error) {
+	const alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 "
+	if size == 0 {
+		return []byte{}, nil
+	}
+
+	raw := make([]byte, size)
+	if _, err := rand.Read(raw); err != nil {
+		return nil, err
+	}
+
+	out := make([]byte, size)
+	for i, b := range raw {
+		out[i] = alphabet[int(b)%len(alphabet)]
+	}
+	return out, nil
+}
+
 type shellLogWriter struct {
 	session *shellSession
 }
@@ -455,6 +520,7 @@ func printShellHelp() {
 	fmt.Println("  aliases                      Show configured aliases")
 	fmt.Println("  unalias <name>               Remove an alias")
 	fmt.Println("  echo <text> > <filename>     Write a file into export_dir and rescan")
+	fmt.Println("  dump <bytes> > <filename>    Write N random printable bytes and rescan")
 	fmt.Println("  rescan                       Rescan export_dir immediately")
 	fmt.Println("  log [clear]                  Show or clear buffered background logs")
 	fmt.Println("  clear                        Clear the terminal screen")

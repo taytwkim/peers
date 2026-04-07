@@ -1,10 +1,10 @@
 # Demo
 
-This directory contains demo assets for `p2pfs`.
+This directory contains assets for demos.
 
-## RPC Demo
+## Local RPC Demo
 
-To run the daemon + RPC demo (which spins up Peer A, Peer B, and Peer C, and generates a test `foo.txt` file):
+To run the local RPC demo (which spins up Peer A, Peer B, and Peer C, and generates a test `foo.txt` file):
 ```bash
 ./demo/rpc_demo.sh start
 ```
@@ -26,6 +26,8 @@ To clean up the spawned log files, temp socket files, `export` directories, and 
 
 ## GCP Cross-VM Demo
 
+### Terraform Setup
+
 Terraform files for a simple 3-VM GCP demo environment live under `demo/gcp`.
 
 The Terraform stack creates:
@@ -39,7 +41,7 @@ along with a firewall rule that opens:
 - `tcp:22` for SSH
 - `tcp:4001-4010` for libp2p demo traffic
 
-The Terraform stack is intentionally minimal:
+The Terraform stack is minimal:
 
 - it creates the VMs
 - it creates the network and firewall rules
@@ -47,14 +49,58 @@ The Terraform stack is intentionally minimal:
 - it does not clone the repo
 - it does not build `p2pfs`
 
-Suggested flow:
-
+**Getting Started**
 1. `cd demo/gcp`
 2. `cp terraform.tfvars.example terraform.tfvars`
 3. Fill in your GCP project and preferred zone.
 4. `terraform init`
 5. `terraform apply`
 6. SSH into the three VMs with the `gcloud compute ssh ...` commands from Terraform outputs.
-7. Manually copy or clone the app onto the VMs, then run the demo.
+7. Install dependencies, clone the repo, build, and run the demo manually.
 
-Use `terraform destroy` when you are done.
+Don't forget to `terraform destroy` when you are done.
+
+### Demo
+
+**1. Start Nodes**
+
+- Start the bootstrap node
+
+```shell
+mkdir -p ~/my_files
+./p2pfs shell --listen /ip4/0.0.0.0/tcp/4001 --export_dir ~/my_files --name peerA
+
+peerA> id
+```
+
+- Start peers
+
+```shell
+mkdir -p ~/my_files
+./p2pfs shell --listen /ip4/0.0.0.0/tcp/4002 --export_dir ~/my_files --name peerB --bootstrap /ip4/<A_PUBLIC_IP>/tcp/4001/p2p/<A_PEER_ID>
+
+peerB> id
+```
+
+```shell
+./p2pfs shell --listen /ip4/0.0.0.0/tcp/4003 --export_dir ~/my_files --name peerC --bootstrap /ip4/<A_PUBLIC_IP>/tcp/4001/p2p/<A_PEER_ID>
+
+peerC> id
+peerC> alias peerB /ip4/<B_PUBLIC_IP>/tcp/4002/p2p/<B_PEER_ID>
+```
+
+**2. Create a New File in Peer B**
+
+```shell
+peerB> echo "hello from peer B" > foo.txt
+peerB> dump 1000000000 > bar.txt
+peerB> files
+```
+
+**3. Fetch from Peer C**
+
+```shell
+peerC> whohas <CID>
+peerC> fetch <CID> peerB
+peerC> cat ~/my_files/foo.txt
+```
