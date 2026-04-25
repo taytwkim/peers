@@ -7,10 +7,8 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -60,10 +58,7 @@ import (
  *      a normal complete local file.
  */
 
-const (
-	maxNumDownloadWorkers = 4
-	peerDownloadRateAlpha = 0.8
-)
+const maxNumDownloadWorkers = 4
 
 // doFetch downloads a file starting from its manifest CID.
 // It is the simple entrypoint used when the caller does not need progress updates.
@@ -201,67 +196,105 @@ func (n *Node) fetchFile(r io.Reader, manifestCID string, resp TransferResponse,
 	return nil
 }
 
-// fetchMissingPieces downloads the pieces we still need for one manifest.
-// It first decides which pieces are missing, then spreads those downloads across workers.
+/*
+ * fetchMissingPieces is the main piece-download scheduler for one manifest.
+ *
+ * Each round does five things in order:
+ * 		1. identify which pieces are still missing after checking the local cache,
+ * 		2. ask participating peers which of those pieces they can currently serve,
+ * 		3. rank the missing pieces rarest-first,
+ * 		4. fan the work out across a bounded number of download workers, and
+ * 		5. if every provider for some piece is currently choking us, wait and retry.
+ *
+ * The loop repeats because choking is treated as temporary. A round may make
+ * partial progress on some pieces, then come back later for the ones that were
+ * blocked by provider cooldowns.
+ */
 func (n *Node) fetchMissingPieces(manifestCID string, manifest *Manifest, status func(format string, args ...any)) error {
-	missingPieces := n.findMissingPieces(manifestCID, removeDuplicatePieces(manifest.Pieces), status)
-	if len(missingPieces) == 0 {
-		return nil
-	}
-
-	pieceSources, err := n.findPeersForPieces(manifestCID, manifest, status)
-	if err != nil {
-		return err
-	}
-
-	// Selection policy:
-	// 1. order work by rarity, 2. let a worker choose the source peer at fetch time.
-	missingPieces = rankPiecesRarestFirst(missingPieces, pieceSources)
-	for _, piece := range missingPieces {
-		if len(pieceSources[piece.CID]) == 0 {
-			return fmt.Errorf("no swarm peer reported piece %d", piece.Index)
+	for {
+		// First, trust the local cache before the network. Anything already
+		// verified on disk drops out of this round immediately.
+		missingPieces := n.findMissingPieces(manifestCID, removeDuplicatePieces(manifest.Pieces), status)
+		if len(missingPieces) == 0 {
+			return nil
 		}
-	}
 
-	numWorkers := maxNumDownloadWorkers
-	if len(missingPieces) < numWorkers {
-		numWorkers = len(missingPieces)
-	}
-
-	jobs := make(chan ManifestPiece)
-	errCh := make(chan error, len(missingPieces))
-	var wg sync.WaitGroup
-
-	for worker := 0; worker < numWorkers; worker++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for piece := range jobs {
-				source, err := n.choosePeerForPiece(manifestCID, piece, pieceSources[piece.CID])
-				if err != nil {
-					errCh <- err
-					continue
-				}
-				if err := n.fetchPieceFromPeer(manifestCID, piece, source, status); err != nil {
-					errCh <- err
-				}
-			}
-		}()
-	}
-
-	for _, piece := range missingPieces {
-		jobs <- piece
-	}
-	close(jobs)
-	wg.Wait()
-	close(errCh)
-
-	for err := range errCh {
+		// Ask currently known participants which of the remaining pieces they
+		// can serve right now.
+		pieceSources, err := n.findPeersForPieces(manifestCID, manifest, status)
 		if err != nil {
 			return err
 		}
+
+		// Order the work rarest-first so the hardest-to-find pieces are claimed
+		// before the common ones.
+		missingPieces = rankPiecesRarestFirst(missingPieces, pieceSources)
+
+		// Every piece in this round must have at least one reported provider.
+		// If not, the manifest is incomplete from the swarm's point of view.
+		for _, piece := range missingPieces {
+			if len(pieceSources[piece.CID]) == 0 {
+				return fmt.Errorf("no swarm peer reported piece %d", piece.Index)
+			}
+		}
+
+		// Use a bounded worker count so one fetch round does not explode into
+		// unbounded concurrent piece requests.
+		numWorkers := maxNumDownloadWorkers
+		if len(missingPieces) < numWorkers {
+			numWorkers = len(missingPieces)
+		}
+
+		jobs := make(chan ManifestPiece)
+		errCh := make(chan error, len(missingPieces))
+		var wg sync.WaitGroup
+
+		for worker := 0; worker < numWorkers; worker++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for piece := range jobs {
+					// The worker chooses a provider at execution time, not queue
+					// construction time, so it can respect the latest peer cooldowns.
+					if err := n.fetchPieceFromProviders(manifestCID, piece, pieceSources[piece.CID], status); err != nil {
+						errCh <- err
+					}
+				}
+			}()
+		}
+
+		// Enqueue all still-missing pieces for this round.
+		for _, piece := range missingPieces {
+			jobs <- piece
+		}
+		close(jobs)
+		wg.Wait()
+		close(errCh)
+
+		// A choke-only round is retryable. Any other error still aborts the
+		// fetch, because it means something stronger than temporary refusal.
+		retryBecauseChoked := false
+		for err := range errCh {
+			if err == nil {
+				continue
+			}
+			if errors.Is(err, errAllProvidersChoked) {
+				retryBecauseChoked = true
+				continue
+			}
+			return err
+		}
+
+		if !retryBecauseChoked {
+			return nil
+		}
+
+		// If choking was the only blocker, pause until the earliest relevant
+		// cooldown expires, then run another scheduling round.
+		delay := n.nextChokeRetryDelay(manifestCID, missingPieces, pieceSources)
+		emitFetchStatus(status, "All current providers for at least one piece are choking us; retrying in %s", delay.Round(time.Second))
+		time.Sleep(delay)
 	}
-	return nil
 }
 
 // findMissingPieces returns the manifest pieces that are not already cached locally.
@@ -278,62 +311,6 @@ func (n *Node) findMissingPieces(manifestCID string, pieces []ManifestPiece, sta
 		missing = append(missing, piece)
 	}
 	return missing
-}
-
-// rankPiecesRarestFirst returns a new slice ordered by rarity.
-// If there is a tie, by order in which the pieces appear in the manifest
-func rankPiecesRarestFirst(pieces []ManifestPiece, pieceSources map[string][]peer.ID) []ManifestPiece {
-	ranked := append([]ManifestPiece(nil), pieces...)
-	sort.SliceStable(ranked, func(i, j int) bool {
-		leftProviders := len(pieceSources[ranked[i].CID])
-		rightProviders := len(pieceSources[ranked[j].CID])
-		if leftProviders != rightProviders {
-			return leftProviders < rightProviders
-		}
-		return ranked[i].Index < ranked[j].Index
-	})
-	return ranked
-}
-
-// For each piece, choose a peer to download from.
-// Unknown peers (SamplesDown == 0) get first priority
-// otherwise we choose the peer with the highest observed download rate for this manifest.
-func (n *Node) choosePeerForPiece(manifestCID string, piece ManifestPiece, providers []peer.ID) (peer.ID, error) {
-	if len(providers) == 0 {
-		return "", fmt.Errorf("no swarm peer reported piece %d", piece.Index)
-	}
-
-	n.stateLock.Lock()
-	defer n.stateLock.Unlock()
-
-	state := n.DownloadState[manifestCID]
-	if state == nil {
-		return "", fmt.Errorf("download state missing for manifest %s", manifestCID)
-	}
-	if state.PeerStats == nil {
-		state.PeerStats = make(map[peer.ID]*PeerState)
-	}
-
-	var bestPeer peer.ID
-	bestRate := -1.0
-	for _, provider := range providers {
-		peerState, exists := state.PeerStats[provider]
-		if !exists {
-			peerState = &PeerState{}
-			state.PeerStats[provider] = peerState
-		}
-		if peerState.SamplesDown == 0 {
-			return provider, nil
-		}
-		if peerState.DownloadRate > bestRate {
-			bestRate = peerState.DownloadRate
-			bestPeer = provider
-		}
-	}
-	if bestPeer == "" {
-		return providers[0], nil
-	}
-	return bestPeer, nil
 }
 
 // findPeersForPieces asks peers participating in the manifest for their availability bitfields
@@ -442,6 +419,9 @@ func (n *Node) fetchPieceFromPeer(manifestCID string, piece ManifestPiece, sourc
 	start := time.Now()
 	data, resp, providerID, err := n.fetchObjectFromPeer(piece.CID, source)
 	if err != nil {
+		if errors.Is(err, errPeerChoked) {
+			return errPeerChoked
+		}
 		return fmt.Errorf("piece %d fetch failed: %w", piece.Index, err)
 	}
 	if resp.Kind != string(ObjectPiece) {
@@ -466,46 +446,6 @@ func (n *Node) fetchPieceFromPeer(manifestCID string, piece ManifestPiece, sourc
 	return nil
 }
 
-// recordPeerDownloadSample updates one peer's per-manifest download estimate.
-// We turn one piece transfer into a bytes/sec sample, then smooth it by computing a
-// moving average so later peer choices are not dominated by a single noisy transfer.
-// new_estimate = alpha * new_sample + (1 - alpha) * old_estimate
-func (n *Node) recordPeerDownloadSample(manifestCID string, peerID peer.ID, bytes int64, elapsed time.Duration) {
-	if peerID == "" || bytes <= 0 {
-		return
-	}
-
-	seconds := elapsed.Seconds()
-	if seconds <= 0 {
-		seconds = math.SmallestNonzeroFloat64
-	}
-	sampleRate := float64(bytes) / seconds
-
-	n.stateLock.Lock()
-	defer n.stateLock.Unlock()
-
-	state := n.DownloadState[manifestCID]
-	if state == nil {
-		return
-	}
-	if state.PeerStats == nil {
-		state.PeerStats = make(map[peer.ID]*PeerState)
-	}
-
-	peerState, exists := state.PeerStats[peerID]
-	if !exists {
-		peerState = &PeerState{}
-		state.PeerStats[peerID] = peerState
-	}
-
-	if peerState.SamplesDown == 0 {
-		peerState.DownloadRate = sampleRate
-	} else {
-		peerState.DownloadRate = peerDownloadRateAlpha*sampleRate + (1-peerDownloadRateAlpha)*peerState.DownloadRate
-	}
-	peerState.SamplesDown++
-}
-
 // fetchObjectFromPeer requests one CID directly from a specific peer and reads it fully into memory.
 // It also verifies that the returned bytes hash back to the CID we asked for.
 func (n *Node) fetchObjectFromPeer(cid string, target peer.ID) ([]byte, TransferResponse, peer.ID, error) {
@@ -527,6 +467,9 @@ func (n *Node) fetchObjectFromPeer(cid string, target peer.ID) ([]byte, Transfer
 		return nil, TransferResponse{}, target, fmt.Errorf("failed to read response header: %w", err)
 	}
 	if resp.Error != "" {
+		if resp.Error == transferErrorChoked {
+			return nil, resp, target, errPeerChoked
+		}
 		return nil, resp, target, fmt.Errorf("remote error: %s", resp.Error)
 	}
 

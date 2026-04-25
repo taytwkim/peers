@@ -93,16 +93,13 @@ func TestChoosePeerForPiecePrefersUnknownThenFastestKnown(t *testing.T) {
 	providers := []peer.ID{peer.ID("peer-a"), peer.ID("peer-b"), peer.ID("peer-c")}
 
 	node := &Node{
-		ctx:           ctx,
-		cancel:        cancel,
-		DownloadState: make(map[string]*FileDownloadState),
+		ctx:               ctx,
+		cancel:            cancel,
+		ManifestPeerState: make(map[string]map[peer.ID]*PeerState),
 	}
-	node.DownloadState[manifestCID] = &FileDownloadState{
-		ManifestCID: manifestCID,
-		PeerStats: map[peer.ID]*PeerState{
-			peer.ID("peer-a"): {DownloadRate: 100, SamplesDown: 2},
-			peer.ID("peer-b"): {DownloadRate: 400, SamplesDown: 3},
-		},
+	node.ManifestPeerState[manifestCID] = map[peer.ID]*PeerState{
+		peer.ID("peer-a"): {DownloadRate: 100, SamplesDown: 2},
+		peer.ID("peer-b"): {DownloadRate: 400, SamplesDown: 3},
 	}
 
 	chosen, err := node.choosePeerForPiece(manifestCID, piece, providers)
@@ -113,7 +110,7 @@ func TestChoosePeerForPiecePrefersUnknownThenFastestKnown(t *testing.T) {
 		t.Fatalf("chosen unknown peer = %s, want peer-c", chosen)
 	}
 
-	node.DownloadState[manifestCID].PeerStats[peer.ID("peer-c")] = &PeerState{DownloadRate: 250, SamplesDown: 1}
+	node.ManifestPeerState[manifestCID][peer.ID("peer-c")] = &PeerState{DownloadRate: 250, SamplesDown: 1}
 	chosen, err = node.choosePeerForPiece(manifestCID, piece, providers)
 	if err != nil {
 		t.Fatal(err)
@@ -132,25 +129,75 @@ func TestRecordPeerDownloadSampleUsesMovingAverage(t *testing.T) {
 	manifestCID := "manifest-1"
 	peerID := peer.ID("peer-a")
 	node := &Node{
-		ctx:           ctx,
-		cancel:        cancel,
-		DownloadState: make(map[string]*FileDownloadState),
-	}
-	node.DownloadState[manifestCID] = &FileDownloadState{
-		ManifestCID: manifestCID,
-		PeerStats:   make(map[peer.ID]*PeerState),
+		ctx:               ctx,
+		cancel:            cancel,
+		ManifestPeerState: make(map[string]map[peer.ID]*PeerState),
 	}
 
 	node.recordPeerDownloadSample(manifestCID, peerID, 100, time.Second)
-	first := node.DownloadState[manifestCID].PeerStats[peerID]
+	first := node.ManifestPeerState[manifestCID][peerID]
 	if first.SamplesDown != 1 || first.DownloadRate != 100 {
 		t.Fatalf("first sample = %+v, want rate=100 samples=1", first)
 	}
 
 	node.recordPeerDownloadSample(manifestCID, peerID, 200, time.Second)
-	second := node.DownloadState[manifestCID].PeerStats[peerID]
+	second := node.ManifestPeerState[manifestCID][peerID]
 	want := peerDownloadRateAlpha*200 + (1-peerDownloadRateAlpha)*100
 	if second.SamplesDown != 2 || math.Abs(second.DownloadRate-want) > 0.0001 {
 		t.Fatalf("second sample = %+v, want rate=%f samples=2", second, want)
+	}
+}
+
+// Verifies that choke reevaluation keeps one optimistic slot and uses
+// download-rate ranking while the manifest is still incomplete.
+func TestReevaluateManifestChokingUsesOptimisticSlot(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	manifestCID := "manifest-1"
+	now := time.Now()
+	node := &Node{
+		ctx:               ctx,
+		cancel:            cancel,
+		DownloadState:     map[string]*FileDownloadState{manifestCID: {ManifestCID: manifestCID}},
+		ManifestPeerState: make(map[string]map[peer.ID]*PeerState),
+	}
+	node.ManifestPeerState[manifestCID] = map[peer.ID]*PeerState{
+		peer.ID("peer-a"): {DownloadRate: 100},
+		peer.ID("peer-b"): {DownloadRate: 80},
+		peer.ID("peer-c"): {DownloadRate: 60},
+		peer.ID("peer-d"): {DownloadRate: 40},
+		peer.ID("peer-e"): {DownloadRate: 20},
+	}
+
+	node.stateLock.Lock()
+	node.reevaluateManifestChokingForLocked(manifestCID, now)
+	node.stateLock.Unlock()
+
+	unchoked := 0
+	optimistic := 0
+	for _, state := range node.ManifestPeerState[manifestCID] {
+		if !state.Choked {
+			unchoked++
+		}
+		if state.Optimistic {
+			optimistic++
+		}
+	}
+	if unchoked != maxUnchokedPeersPerManifest {
+		t.Fatalf("unchoked peers = %d, want %d", unchoked, maxUnchokedPeersPerManifest)
+	}
+	if optimistic != 1 {
+		t.Fatalf("optimistic slots = %d, want 1", optimistic)
+	}
+	optimisticPeer := peer.ID("")
+	for peerID, state := range node.ManifestPeerState[manifestCID] {
+		if state.Optimistic {
+			optimisticPeer = peerID
+			break
+		}
+	}
+	if optimisticPeer != peer.ID("peer-d") && optimisticPeer != peer.ID("peer-e") {
+		t.Fatalf("optimistic peer = %s, want one of the remaining non-regular peers", optimisticPeer)
 	}
 }

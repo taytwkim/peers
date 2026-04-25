@@ -94,35 +94,24 @@ type FileDownloadState struct {
 	ManifestPath string
 	ManifestSize int64
 	Have         []bool
-	PeerStats    map[peer.ID]*PeerState // peerID -> PeerState
-}
-
-// PeerState stores per-manifest observations and future choke-related flags.
-type PeerState struct {
-	DownloadRate float64
-	UploadRate   float64
-	SamplesDown  int
-	SamplesUp    int
-	Choked       bool
-	Interested   bool
-	LastUnchoke  time.Time
 }
 
 // Node is a p2p daemon
 type Node struct {
-	ctx           context.Context // ctx and cancel are used to manage the lifecycle of daemons.
-	cancel        context.CancelFunc
-	Host          host.Host // core engine provided by libp2p, representing your presence on the network.
-	ExportDir     string    // local path to the folder where shared files live.
-	RpcSocket     string    // path to the local Unix Domain Socket used for CLI commands.
-	CompleteFiles map[string]CompleteFile
-	DownloadState map[string]*FileDownloadState
-	ServedObjects map[string]LocalObjectRecord // all local objects this node can serve, keyed by CID.
-	stateLock     sync.RWMutex                 // protects CompleteFiles, DownloadState, and ServedObjects.
-	DHT           DHTNode                      // Kademlia DHT used for provider registration and lookup.
-	ProvidedCIDs  map[string]struct{}          // manifest CIDs already announced into the DHT as file swarms.
-	providedLock  sync.Mutex
-	rpcListener   net.Listener // rpcListener holds the open Unix Domain Socket listener for CLI clients.
+	ctx               context.Context // ctx and cancel are used to manage the lifecycle of daemons.
+	cancel            context.CancelFunc
+	Host              host.Host // core engine provided by libp2p, representing your presence on the network.
+	ExportDir         string    // local path to the folder where shared files live.
+	RpcSocket         string    // path to the local Unix Domain Socket used for CLI commands.
+	CompleteFiles     map[string]CompleteFile
+	DownloadState     map[string]*FileDownloadState
+	ManifestPeerState map[string]map[peer.ID]*PeerState // manifestCID -> peerID -> per-manifest peer state
+	ServedObjects     map[string]LocalObjectRecord      // all local objects this node can serve, keyed by CID.
+	stateLock         sync.RWMutex                      // protects CompleteFiles, DownloadState, and ServedObjects.
+	DHT               DHTNode                           // Kademlia DHT used for provider registration and lookup.
+	ProvidedCIDs      map[string]struct{}               // manifest CIDs already announced into the DHT as file swarms.
+	providedLock      sync.Mutex
+	rpcListener       net.Listener // rpcListener holds the open Unix Domain Socket listener for CLI clients.
 }
 
 // NewNode initializes a new libp2p node, connects to bootstrap nodes, and starts background tasks
@@ -139,15 +128,16 @@ func NewNode(listenAddr, exportDir, rpcSocket string, bootstrapAddrs []string) (
 	}
 
 	n := &Node{
-		ctx:           ctx,
-		cancel:        cancel,
-		Host:          h,
-		ExportDir:     exportDir,
-		RpcSocket:     rpcSocket,
-		CompleteFiles: make(map[string]CompleteFile),
-		DownloadState: make(map[string]*FileDownloadState),
-		ServedObjects: make(map[string]LocalObjectRecord),
-		ProvidedCIDs:  make(map[string]struct{}),
+		ctx:               ctx,
+		cancel:            cancel,
+		Host:              h,
+		ExportDir:         exportDir,
+		RpcSocket:         rpcSocket,
+		CompleteFiles:     make(map[string]CompleteFile),
+		DownloadState:     make(map[string]*FileDownloadState),
+		ManifestPeerState: make(map[string]map[peer.ID]*PeerState),
+		ServedObjects:     make(map[string]LocalObjectRecord),
+		ProvidedCIDs:      make(map[string]struct{}),
 	}
 
 	log.Printf("Host created. Our Peer ID: %s", h.ID().String())
@@ -186,6 +176,7 @@ func NewNode(listenAddr, exportDir, rpcSocket string, bootstrapAddrs []string) (
 
 	// 5. Start scanning local directory periodically
 	go n.scanLocalObjects()
+	go n.runChokeReevaluationLoop()
 
 	// 6. Register protocols
 	n.setupTransferProtocol()
@@ -410,7 +401,6 @@ func (n *Node) startDownloadState(manifestCID string, manifest *Manifest, manife
 			ManifestPath: manifestPath,
 			ManifestSize: manifestSize,
 			Have:         make([]bool, len(manifest.Pieces)),
-			PeerStats:    make(map[peer.ID]*PeerState),
 		}
 		n.DownloadState[manifestCID] = state
 	} else {
@@ -420,9 +410,12 @@ func (n *Node) startDownloadState(manifestCID string, manifest *Manifest, manife
 		if len(state.Have) != len(manifest.Pieces) {
 			state.Have = make([]bool, len(manifest.Pieces))
 		}
-		if state.PeerStats == nil {
-			state.PeerStats = make(map[peer.ID]*PeerState)
-		}
+	}
+	if n.ManifestPeerState == nil {
+		n.ManifestPeerState = make(map[string]map[peer.ID]*PeerState)
+	}
+	if _, exists := n.ManifestPeerState[manifestCID]; !exists {
+		n.ManifestPeerState[manifestCID] = make(map[peer.ID]*PeerState)
 	}
 	n.rebuildServedObjectsLocked()
 	servedObjects := cloneServedObjects(n.ServedObjects)
@@ -448,28 +441,6 @@ func (n *Node) clearDownloadState(manifestCID string) {
 	delete(n.DownloadState, manifestCID)
 	n.rebuildServedObjectsLocked()
 	n.stateLock.Unlock()
-}
-
-// ensurePeerStateExists creates the per-manifest PeerStats entry for one peer
-// if it is missing. This lets selection treat the peer as known-but-unmeasured.
-func (n *Node) ensurePeerStateExists(manifestCID string, peerID peer.ID) {
-	if peerID == "" {
-		return
-	}
-
-	n.stateLock.Lock()
-	defer n.stateLock.Unlock()
-
-	state := n.DownloadState[manifestCID]
-	if state == nil {
-		return
-	}
-	if state.PeerStats == nil {
-		state.PeerStats = make(map[peer.ID]*PeerState)
-	}
-	if _, exists := state.PeerStats[peerID]; !exists {
-		state.PeerStats[peerID] = &PeerState{}
-	}
 }
 
 // helper that creates .tinytorrent/manifests and .tinytorrent/pieces

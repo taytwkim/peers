@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"time"
 
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -16,6 +17,8 @@ import (
 // handler, answer GET requests, and handle the small response framing helpers.
 
 const transferProtocol = "/tinytorrent/get/1.0.0"
+
+const transferErrorChoked = "choked"
 
 type TransferRequest struct {
 	CID string `json:"cid"`
@@ -57,6 +60,15 @@ func (n *Node) handleTransferStream(s network.Stream) {
 		return
 	}
 
+	if record.Kind == ObjectPiece {
+		remotePeer := s.Conn().RemotePeer()
+		n.ensurePeerStateExists(record.ManifestCID, remotePeer)
+		if !n.isPeerUnchokedForManifest(record.ManifestCID, remotePeer) {
+			encoder.Encode(TransferResponse{Error: transferErrorChoked})
+			return
+		}
+	}
+
 	file, err := os.Open(record.Path)
 	if err != nil {
 		encoder.Encode(TransferResponse{Error: "Internal server error"})
@@ -83,10 +95,14 @@ func (n *Node) handleTransferStream(s network.Stream) {
 	if record.Kind == ObjectPiece {
 		reader = io.LimitReader(file, record.Length)
 	}
+	start := time.Now()
 	written, err := io.Copy(s, reader)
 	if err != nil {
 		log.Printf("Error sending CID %s: %v", req.CID, err)
 	} else {
+		if record.Kind == ObjectPiece {
+			n.recordPeerUploadSample(record.ManifestCID, s.Conn().RemotePeer(), written, time.Since(start))
+		}
 		log.Printf("Sent %d bytes of CID %s to %s", written, req.CID, s.Conn().RemotePeer())
 	}
 }
