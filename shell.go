@@ -492,7 +492,7 @@ func printShellHelp() {
 	fmt.Println("  id                           Show peer ID and listen addresses")
 	fmt.Println("  files                        Show local files discovered in export_dir")
 	fmt.Println("  whohas <manifest-cid>        Query the DHT for peers in a manifest swarm")
-	fmt.Println("  fetch <manifest-cid> [peer|alias] Fetch a file by manifest CID")
+	fmt.Println("  fetch <manifest-cid>         Fetch a file by manifest CID")
 	fmt.Println("  list <multiaddr|alias>       List the files served by a remote peer")
 	fmt.Println("  alias <name> <target>        Save a short alias for a peer ID or multiaddr")
 	fmt.Println("  aliases                      Show configured aliases")
