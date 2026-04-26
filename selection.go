@@ -62,13 +62,16 @@ func (n *Node) choosePeerForPiece(manifestCID string, piece ManifestPiece, provi
 			peerStates[provider] = peerState
 		}
 		if !peerState.ChokedUntil.IsZero() && now.Before(peerState.ChokedUntil) {
+			logFetchDetail("piece %d: skipping provider %s until %s", piece.Index, provider, peerState.ChokedUntil.Format(time.RFC3339))
 			continue
 		}
 		if !peerState.ChokedUntil.IsZero() && !now.Before(peerState.ChokedUntil) {
 			peerState.RemoteChokesUs = false
 			peerState.ChokedUntil = time.Time{}
+			logFetchDetail("piece %d: provider %s cooldown expired", piece.Index, provider)
 		}
 		if peerState.SamplesDown == 0 {
+			logFetchDetail("piece %d: choosing unmeasured provider %s", piece.Index, provider)
 			return provider, nil
 		}
 		if peerState.DownloadRate > bestRate {
@@ -77,8 +80,10 @@ func (n *Node) choosePeerForPiece(manifestCID string, piece ManifestPiece, provi
 		}
 	}
 	if bestPeer == "" {
+		logFetchDetail("piece %d: every known provider is currently cooling down after choking us", piece.Index)
 		return "", errAllProvidersChoked
 	}
+	logFetchDetail("piece %d: choosing fastest available provider %s at %.1f bytes/sec", piece.Index, bestPeer, bestRate)
 	return bestPeer, nil
 }
 
@@ -100,12 +105,14 @@ func (n *Node) fetchPieceFromProviders(manifestCID string, piece ManifestPiece, 
 			return nil
 		}
 		if errors.Is(err, errPeerChoked) {
+			logFetchDetail("piece %d: provider %s choked us; trying another provider if available", piece.Index, source)
 			n.markPeerChokingUs(manifestCID, source)
 			remaining = removeProvider(remaining, source)
 			continue
 		}
 		return err
 	}
+	logFetchDetail("piece %d: ran out of non-choking providers in this round", piece.Index)
 	return errAllProvidersChoked
 }
 

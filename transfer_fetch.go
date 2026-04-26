@@ -74,12 +74,12 @@ func (n *Node) doFetchWithStatus(manifestCID string, status func(format string, 
 		return err
 	}
 
-	emitFetchStatus(status, "Fetching manifest %s from %s", manifestCID, target)
+	emitFetchHighlight(status, "Fetching manifest %s from %s", manifestCID, target)
 
 	ctx := context.Background()
 	if providerInfo.ID != "" && len(providerInfo.Addrs) > 0 {
 		if err := n.Host.Connect(ctx, providerInfo); err != nil {
-			emitFetchStatus(status, "Warning: failed to explicitly connect to provider: %v", err)
+			emitFetchHighlight(status, "Warning: failed to explicitly connect to provider: %v", err)
 		}
 	}
 
@@ -111,7 +111,7 @@ func (n *Node) doFetchWithStatus(manifestCID string, status func(format string, 
 // fetchFile verifies a downloaded manifest, fetches its pieces,
 // joins them in order, and writes the final file to the export directory.
 func (n *Node) fetchFile(r io.Reader, manifestCID string, resp TransferResponse, status func(format string, args ...any)) error {
-	emitFetchStatus(status, "Fetching manifest %s", manifestCID)
+	emitFetchHighlight(status, "Fetching manifest %s", manifestCID)
 
 	manifestBytes, err := io.ReadAll(io.LimitReader(r, resp.Filesize))
 	if err != nil {
@@ -146,7 +146,7 @@ func (n *Node) fetchFile(r io.Reader, manifestCID string, resp TransferResponse,
 	}
 	n.startDownloadState(manifestCID, &manifest, manifestPath, int64(len(manifestBytes)))
 
-	emitFetchStatus(status, "Manifest describes %s: %d bytes, %d pieces", manifest.Filename, manifest.FileSize, len(manifest.Pieces))
+	emitFetchHighlight(status, "Manifest describes %s: %d bytes, %d pieces", manifest.Filename, manifest.FileSize, len(manifest.Pieces))
 	if err := n.fetchMissingPieces(manifestCID, &manifest, status); err != nil {
 		return err
 	}
@@ -192,7 +192,7 @@ func (n *Node) fetchFile(r io.Reader, manifestCID string, resp TransferResponse,
 
 	n.clearDownloadState(manifestCID)
 	n.updateLocalObjects()
-	emitFetchStatus(status, "Successfully reconstructed %s as %s", manifest.FileCID, filepath.Base(finalPath))
+	emitFetchHighlight(status, "Successfully reconstructed %s as %s", manifest.FileCID, filepath.Base(finalPath))
 	return nil
 }
 
@@ -203,17 +203,19 @@ func (n *Node) fetchFile(r io.Reader, manifestCID string, resp TransferResponse,
  * 		1. identify which pieces are still missing after checking the local cache,
  * 		2. ask participating peers which of those pieces they can currently serve,
  * 		3. rank the missing pieces rarest-first,
- * 		4. fan the work out across a bounded number of download workers, and
+ * 		4. fan the work out across a bounded number of workers, and
  * 		5. if every provider for some piece is currently choking us, wait and retry.
  *
  * The loop repeats because choking is treated as temporary. A round may make
  * partial progress on some pieces, then come back later for the ones that were
  * blocked by provider cooldowns.
+ *
+ * A “round” here means one full pass over the current missingPieces list.
  */
 func (n *Node) fetchMissingPieces(manifestCID string, manifest *Manifest, status func(format string, args ...any)) error {
 	for {
 		// First, trust the local cache before the network. Anything already
-		// verified on disk drops out of this round immediately.
+		// verified on disk drops out of the round.
 		missingPieces := n.findMissingPieces(manifestCID, removeDuplicatePieces(manifest.Pieces), status)
 		if len(missingPieces) == 0 {
 			return nil
@@ -226,8 +228,7 @@ func (n *Node) fetchMissingPieces(manifestCID string, manifest *Manifest, status
 			return err
 		}
 
-		// Order the work rarest-first so the hardest-to-find pieces are claimed
-		// before the common ones.
+		// Order the work rarest-first so the hardest-to-find pieces are prioritized
 		missingPieces = rankPiecesRarestFirst(missingPieces, pieceSources)
 
 		// Every piece in this round must have at least one reported provider.
@@ -249,13 +250,19 @@ func (n *Node) fetchMissingPieces(manifestCID string, manifest *Manifest, status
 		errCh := make(chan error, len(missingPieces))
 		var wg sync.WaitGroup
 
+		// Start workers
 		for worker := 0; worker < numWorkers; worker++ {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
+
+				// `range jobs` does:
+				//   1. receive one piece from the shared jobs channel,
+				//   2. fetch it,
+				//   3. repeat until `jobs` is closed and drained.
 				for piece := range jobs {
-					// The worker chooses a provider at execution time, not queue
-					// construction time, so it can respect the latest peer cooldowns.
+					// The worker chooses a provider at execution time, not at queue
+					// construction time, so it can respect the latest cooldowns.
 					if err := n.fetchPieceFromProviders(manifestCID, piece, pieceSources[piece.CID], status); err != nil {
 						errCh <- err
 					}
@@ -263,16 +270,24 @@ func (n *Node) fetchMissingPieces(manifestCID string, manifest *Manifest, status
 			}()
 		}
 
-		// Enqueue all still-missing pieces for this round.
+		// This loop defines the work for one round: send every still-missing
+		// piece into the shared queue once. Multiple workers may consume these
+		// jobs in parallel, but the sends happen here one piece at a time.
 		for _, piece := range missingPieces {
 			jobs <- piece
 		}
+
+		// No more pieces will be sent in this round. Workers finish whatever
+		// they already received, then exit their `range jobs` loop.
 		close(jobs)
+
+		// Wait for every worker launched above to finish before we inspect the
+		// round's errors. After this point, nothing will send into errCh again.
 		wg.Wait()
 		close(errCh)
 
-		// A choke-only round is retryable. Any other error still aborts the
-		// fetch, because it means something stronger than temporary refusal.
+		// If some pieces in this round were skipped because we were choked by all providers (choke err),
+		// we can retry when the cooldowns expire. Any other error aborts the fetch.
 		retryBecauseChoked := false
 		for err := range errCh {
 			if err == nil {
@@ -292,7 +307,7 @@ func (n *Node) fetchMissingPieces(manifestCID string, manifest *Manifest, status
 		// If choking was the only blocker, pause until the earliest relevant
 		// cooldown expires, then run another scheduling round.
 		delay := n.nextChokeRetryDelay(manifestCID, missingPieces, pieceSources)
-		emitFetchStatus(status, "All current providers for at least one piece are choking us; retrying in %s", delay.Round(time.Second))
+		emitFetchHighlight(status, "All current providers for at least one piece are choking us; retrying in %s", delay.Round(time.Second))
 		time.Sleep(delay)
 	}
 }
@@ -305,7 +320,7 @@ func (n *Node) findMissingPieces(manifestCID string, pieces []ManifestPiece, sta
 		piecePath := pieceStoragePath(n.ExportDir, piece.CID)
 		if cachedCID, err := ComputeCID(piecePath); err == nil && cachedCID == piece.CID {
 			n.markPieceAvailable(manifestCID, piece)
-			emitFetchStatus(status, "piece %d cached locally", piece.Index)
+			logFetchDetail("piece %d cached locally", piece.Index)
 			continue
 		}
 		missing = append(missing, piece)
@@ -321,7 +336,7 @@ func (n *Node) findPeersForPieces(manifestCID string, manifest *Manifest, status
 		return nil, err
 	}
 
-	emitFetchStatus(status, "Discovered %d swarm peer(s) for manifest %s", len(participants), manifestCID)
+	emitFetchHighlight(status, "Discovered %d swarm peer(s) for manifest %s", len(participants), manifestCID)
 
 	pieceSources := make(map[string][]peer.ID, len(manifest.Pieces))
 	for _, info := range participants {
@@ -330,11 +345,11 @@ func (n *Node) findPeersForPieces(manifestCID string, manifest *Manifest, status
 		n.ensurePeerStateExists(manifestCID, info.ID)
 		availability, err := n.doAvailability(info, manifestCID)
 		if err != nil {
-			emitFetchStatus(status, "Skipping %s: availability failed: %v", info.ID, err)
+			logFetchDetail("Skipping %s: availability failed: %v", info.ID, err)
 			continue
 		}
 		if len(availability) != len(manifest.Pieces) {
-			emitFetchStatus(status, "Skipping %s: availability length %d does not match %d pieces", info.ID, len(availability), len(manifest.Pieces))
+			logFetchDetail("Skipping %s: availability length %d does not match %d pieces", info.ID, len(availability), len(manifest.Pieces))
 			continue
 		}
 		for i, hasPiece := range availability {
@@ -345,14 +360,14 @@ func (n *Node) findPeersForPieces(manifestCID string, manifest *Manifest, status
 		}
 	}
 
-	emitFetchStatus(status, "Piece availability:")
+	logFetchDetail("Piece availability:")
 	for _, piece := range manifest.Pieces {
 		peers := pieceSources[piece.CID]
 		if len(peers) == 0 {
-			emitFetchStatus(status, "  piece %d: none", piece.Index)
+			logFetchDetail("  piece %d: none", piece.Index)
 			continue
 		}
-		emitFetchStatus(status, "  piece %d: %s", piece.Index, formatPeerIDs(peers))
+		logFetchDetail("  piece %d: %s", piece.Index, formatPeerIDs(peers))
 	}
 
 	return pieceSources, nil
@@ -412,7 +427,7 @@ func (n *Node) fetchPieceFromPeer(manifestCID string, piece ManifestPiece, sourc
 	piecePath := pieceStoragePath(n.ExportDir, piece.CID)
 	if cachedCID, err := ComputeCID(piecePath); err == nil && cachedCID == piece.CID {
 		n.markPieceAvailable(manifestCID, piece)
-		emitFetchStatus(status, "piece %d cached locally", piece.Index)
+		logFetchDetail("piece %d cached locally", piece.Index)
 		return nil
 	}
 
@@ -442,7 +457,7 @@ func (n *Node) fetchPieceFromPeer(manifestCID string, piece ManifestPiece, sourc
 
 	n.markPieceAvailable(manifestCID, piece)
 	n.recordPeerDownloadSample(manifestCID, providerID, piece.Size, time.Since(start))
-	emitFetchStatus(status, "piece %d fetched from %s (%d bytes)", piece.Index, providerID, piece.Size)
+	logFetchDetail("piece %d fetched from %s (%d bytes)", piece.Index, providerID, piece.Size)
 	return nil
 }
 
@@ -593,13 +608,17 @@ func uniqueDownloadPath(path string) string {
 	}
 }
 
-// emitFetchStatus is a tiny helper for progress messages. If the caller gave us
-// a status function, send the message there; otherwise write it to the normal
-// log.
-func emitFetchStatus(status func(format string, args ...any), format string, args ...any) {
+// emitFetchHighlight writes a high-level fetch progress line to the normal log
+// and, when a caller asked for live status, forwards it to that callback too.
+func emitFetchHighlight(status func(format string, args ...any), format string, args ...any) {
+	log.Printf(format, args...)
 	if status != nil {
 		status(format, args...)
-		return
 	}
+}
+
+// logFetchDetail records fetch internals in the normal log without sending
+// every line back to the interactive caller or RPC client.
+func logFetchDetail(format string, args ...any) {
 	log.Printf(format, args...)
 }
